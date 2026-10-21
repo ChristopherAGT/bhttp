@@ -19,7 +19,7 @@ SERVER_PY="$DESTDIR/bhttp-server.py"
 UNIT="/etc/systemd/system/bhttp.service"
 SERVICE="bhttp"
 
-SERVER_URL="https://raw.githubusercontent.com/ChristopherAGT/bhttp-server/main/bhttp-server.py"
+SERVER_URL="https://raw.githubusercontent.com/ChristopherAGT/bhttp-protocol/main/bhttp-server.py"
 
 # PUERTO: puerto público en el que escuchará BHTTP.
 # SSHPORT: puerto del servicio SSH al que se redirige el túnel.
