@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 # Servidor BHTTP autonomo para DTunnel (version asyncio).
 # Mantiene el formato binario y el algoritmo de mascara existentes.
@@ -7,15 +8,18 @@
 # Mascara        : XOR con SHA256(sessionId||mode||seq||dir||contador)
 # Modos          : 0=probe 1=subida 2=bajada 3=lote 4=ack
 #
-# Correcciones:
-# - Un timeout de descarga no adelanta ni salta secuencias.
-# - Las escrituras al backend no mantienen bloqueado el cond de la sesion.
-# - Se limita estrictamente el buffer de descarga.
-# - Se limita la memoria de las subidas pendientes.
-# - Se evita confirmar una subida antes de escribirla en el backend.
-# - Los ACK no crean sesiones de backend innecesarias.
-# - Se gestionan cierres, errores y limpieza de recursos.
-# - Se conserva el formato de trama y el algoritmo de mascara.
+# Mejoras:
+# - Conserva el protocolo binario y la mascara originales.
+# - Permite sesiones independientes y simultaneas.
+# - Valida tamanos y secuencias de las tramas.
+# - Limita buffers de descarga y subidas pendientes.
+# - No mantiene el bloqueo de condicion durante drain().
+# - No confirma una subida antes de escribirla al backend.
+# - No salta secuencias de descarga al vencer un timeout.
+# - Gestiona ACK, conexiones y limpieza de sesiones.
+#
+# IMPORTANTE:
+# La compatibilidad final debe comprobarse con la version real de DTunnel.
 
 import argparse
 import asyncio
@@ -26,7 +30,6 @@ import time
 MAGIC = b"BHP1"
 LONGPOLL = 2.0
 
-# Limites de seguridad y recursos.
 MAX_FRAME_SIZE = 16 * 1024 * 1024
 MAX_DOWN_BUFFER = 8 * 1024 * 1024
 MAX_UNACKED_BYTES = 8 * 1024 * 1024
@@ -56,7 +59,7 @@ def keystream(sess, mode, seq, d, n):
     while len(out) < n:
         h = base.copy()
         h.update(counter.to_bytes(4, "big"))
-        out += h.digest()
+        out.extend(h.digest())
         counter += 1
 
     return bytes(out[:n])
@@ -68,7 +71,7 @@ def mask(data, sess, mode, seq, d):
 
 
 def probe_reply(mode, size):
-    # Se conserva la estructura de respuesta del probe original.
+    # Estructura de respuesta BHP1 conservada.
     n = size if (mode == 2 and size >= 10) else 10
     out = bytearray(MAGIC + bytes([1, mode]) + size.to_bytes(4, "big"))
 
@@ -130,8 +133,7 @@ class Session:
 
         try:
             while True:
-                # Reservar espacio antes de leer para no superar
-                # MAX_DOWN_BUFFER con un bloque adicional.
+                # Esperar a que exista espacio antes de leer.
                 async with self.cond:
                     while (
                         len(self.down_raw) >= MAX_DOWN_BUFFER
@@ -157,9 +159,9 @@ class Session:
                     if self.closed:
                         break
 
-                    # Solo este lector agrega datos a down_raw.
-                    # La capacidad reservada no puede reducirse
-                    # mientras la lectura esta en curso.
+                    # Solo esta tarea agrega datos al buffer.
+                    # Las descargas pueden liberar espacio mientras
+                    # la lectura de red esta pendiente.
                     self.down_raw.extend(data)
                     total += len(data)
                     self.last_activity = time.monotonic()
@@ -185,8 +187,7 @@ class Session:
             )
 
     async def upload(self, seq, data):
-        # Solo una subida procesa la cola a la vez.
-        # El candado cond se libera antes de esperar a drain().
+        # Una sola tarea procesa la cola de subida a la vez.
         async with self.up_lock:
             async with self.cond:
                 if self.closed or self.eof or self.bw is None:
@@ -194,11 +195,18 @@ class Session:
 
                 self.last_activity = time.monotonic()
 
-                # Una retransmision ya procesada no se escribe otra vez.
+                # No duplicar datos ya procesados.
                 if seq < self.up_next:
                     return
 
-                if seq not in self.up_pending:
+                # No reemplazar silenciosamente una secuencia pendiente
+                # con datos diferentes.
+                if seq in self.up_pending:
+                    if self.up_pending[seq] != data:
+                        raise ValueError(
+                            "secuencia de subida repetida con datos distintos"
+                        )
+                else:
                     if len(self.up_pending) >= MAX_PENDING_UPLOADS:
                         raise BufferError(
                             "demasiadas subidas pendientes"
@@ -215,69 +223,66 @@ class Session:
                     self.up_pending[seq] = data
                     self.up_pending_bytes += len(data)
 
-                # Procesar solo las secuencias consecutivas.
-                while True:
+            # IMPORTANTE: el bloqueo cond esta liberado aqui.
+            # Esto permite que _reader y download sigan trabajando.
+            while True:
+                async with self.cond:
+                    if self.closed or self.eof or self.bw is None:
+                        raise ConnectionError("sesion backend cerrada")
+
+                    current_seq = self.up_next
+
+                    if current_seq not in self.up_pending:
+                        return
+
+                    chunk = self.up_pending[current_seq]
+
+                try:
+                    self.bw.write(chunk)
+
+                    await asyncio.wait_for(
+                        self.bw.drain(),
+                        timeout=WRITE_TIMEOUT
+                    )
+
+                except asyncio.CancelledError:
+                    raise
+
+                except Exception as e:
                     async with self.cond:
-                        if self.closed or self.eof or self.bw is None:
-                            raise ConnectionError(
-                                "sesion backend cerrada"
-                            )
+                        self.closed = True
+                        self.close_reason = "error de escritura backend"
+                        self.closed_at = time.monotonic()
+                        self.eof = True
+                        self.cond.notify_all()
 
-                        current_seq = self.up_next
+                    log(
+                        "sesion %s: fallo escribiendo al backend: %s"
+                        % (self.sess.hex()[:8], e)
+                    )
 
-                        if current_seq not in self.up_pending:
-                            return
+                    await self.close("error de escritura backend")
 
-                        chunk = self.up_pending[current_seq]
+                    raise ConnectionError(
+                        "fallo de escritura al backend"
+                    ) from e
 
-                    # No mantener self.cond durante la escritura de red.
-                    try:
-                        self.bw.write(chunk)
+                async with self.cond:
+                    # La subida se considera procesada solamente
+                    # despues de completar drain().
+                    if (
+                        self.up_next == current_seq
+                        and current_seq in self.up_pending
+                    ):
+                        completed = self.up_pending.pop(current_seq)
+                        self.up_pending_bytes -= len(completed)
 
-                        await asyncio.wait_for(
-                            self.bw.drain(),
-                            timeout=WRITE_TIMEOUT
-                        )
+                        if self.up_pending_bytes < 0:
+                            self.up_pending_bytes = 0
 
-                    except asyncio.CancelledError:
-                        raise
-
-                    except Exception as e:
-                        async with self.cond:
-                            self.closed = True
-                            self.close_reason = (
-                                "error de escritura backend"
-                            )
-                            self.closed_at = time.monotonic()
-                            self.cond.notify_all()
-
-                        log(
-                            "sesion %s: fallo escribiendo al backend: %s"
-                            % (self.sess.hex()[:8], e)
-                        )
-
-                        await self.close("error de escritura backend")
-
-                        raise ConnectionError(
-                            "fallo de escritura al backend"
-                        ) from e
-
-                    async with self.cond:
-                        # La subida esta serializada por up_lock.
-                        # Confirmar la secuencia despues de drain().
-                        if (
-                            self.up_next == current_seq
-                            and current_seq in self.up_pending
-                        ):
-                            completed = self.up_pending.pop(current_seq)
-                            self.up_pending_bytes -= len(completed)
-
-                            if self.up_pending_bytes < 0:
-                                self.up_pending_bytes = 0
-
-                            self.up_next += 1
-                            self.last_activity = time.monotonic()
-                            self.cond.notify_all()
+                        self.up_next += 1
+                        self.last_activity = time.monotonic()
+                        self.cond.notify_all()
 
     async def download(self, seq, maxlen, deadline):
         if maxlen <= 0:
@@ -290,19 +295,17 @@ class Session:
             while True:
                 self.last_activity = time.monotonic()
 
-                # Retransmision: devolver el mismo fragmento si sigue
-                # almacenado. Si ya fue confirmado, no se reconstruye.
+                # Repeticion de una secuencia que ya fue asignada.
                 if seq < self.down_assign:
                     return self.down_chunks.get(seq, b"")
 
                 if self.closed and not self.down_raw:
                     return b""
 
-                # Solo se asigna el siguiente numero de secuencia.
-                # Las peticiones adelantadas esperan a que lleguen
-                # las secuencias anteriores.
+                # Solo asignar el siguiente numero de secuencia.
+                # Las peticiones adelantadas esperan su turno.
                 if seq == self.down_assign:
-                    can_assign_chunk = (
+                    can_assign = (
                         len(self.down_chunks) < MAX_UNACKED_CHUNKS
                     )
 
@@ -312,7 +315,7 @@ class Session:
 
                     if (
                         self.down_raw
-                        and can_assign_chunk
+                        and can_assign
                         and available_bytes > 0
                     ):
                         take_len = min(
@@ -333,7 +336,7 @@ class Session:
                             return take
 
                     if self.eof and not self.down_raw:
-                        if can_assign_chunk:
+                        if can_assign:
                             self.down_chunks[seq] = b""
                             self.down_assign += 1
                             self.cond.notify_all()
@@ -343,10 +346,8 @@ class Session:
                 remaining = deadline - loop.time()
 
                 if remaining <= 0 or self.closed:
-                    # IMPORTANTE:
-                    # Un timeout no consume ni salta secuencias.
-                    # La misma secuencia puede reintentarse cuando
-                    # lleguen datos o se libere espacio en el buffer.
+                    # Un timeout no consume secuencias.
+                    # La peticion puede repetirse al llegar datos.
                     self.cond.notify_all()
                     return b""
 
@@ -356,7 +357,6 @@ class Session:
                         timeout=remaining
                     )
                 except asyncio.TimeoutError:
-                    # Volver al bucle para comprobar el estado.
                     pass
 
     async def ack(self, seq):
@@ -421,11 +421,9 @@ class Server:
             if s is not None and not s.closed:
                 return s
 
-            # Retirar solo la sesion solicitada si ya esta cerrada.
             if s is not None and s.closed:
                 del self.sessions[sess]
 
-            # Limpiar sesiones cerradas que superaron la retencion.
             now = time.monotonic()
 
             for old_sid, old in list(self.sessions.items()):
@@ -465,7 +463,7 @@ class Server:
         while True:
             await asyncio.sleep(CLEANUP_INTERVAL)
             now = time.monotonic()
-            to_close = []
+            expired = []
 
             async with self.slock:
                 for sid, s in list(self.sessions.items()):
@@ -475,11 +473,11 @@ class Server:
                         and now - s.closed_at >= CLOSED_SESSION_RETENTION
                     ):
                         del self.sessions[sid]
-                        to_close.append(s)
+                        expired.append(s)
 
-            if to_close:
+            if expired:
                 await asyncio.gather(
-                    *(s.close("limpieza de sesion") for s in to_close),
+                    *(s.close("limpieza de sesion") for s in expired),
                     return_exceptions=True
                 )
 
@@ -509,17 +507,15 @@ class Server:
 
                 payload = b""
 
-                # Se mantiene el procesamiento original del payload.
                 if ln and mode in (0, 1, 2, 3):
                     raw = await reader.readexactly(ln)
                     payload = mask(raw, sess, mode, seq, 0)
 
                 elif ln and mode == 4:
-                    # ACK no admite payload en el protocolo implementado.
                     log("ACK con payload no admitido desde %s" % (peer,))
                     break
 
-                # Probe BHP1: responder sin abrir una sesion SSH.
+                # Handshake BHP1: no crear backend para el probe.
                 if payload[:4] == MAGIC:
                     size = (
                         int.from_bytes(payload[6:10], "big")
@@ -543,7 +539,6 @@ class Server:
                     continue
 
                 if mode == 0:
-                    # Probe sin MAGIC: respuesta vacia, sin backend.
                     writer.write(bytes([0]) + (0).to_bytes(4, "big"))
                     await writer.drain()
                     continue
@@ -563,7 +558,7 @@ class Server:
                 if mode == 1:
                     await s.upload(seq, payload)
 
-                    # Se confirma la subida despues de completar drain().
+                    # ACK de subida despues de escribir al backend.
                     writer.write(bytes([0]) + (0).to_bytes(4, "big"))
                     await writer.drain()
 
@@ -590,7 +585,6 @@ class Server:
                     chunk_size = min(chunk_size, MAX_FRAME_SIZE)
                     count = max(1, count)
 
-                    # Evitar desbordamiento de la secuencia de 64 bits.
                     if seq + count - 1 > (1 << 64) - 1:
                         log("lote excede el rango de secuencia desde %s" % peer)
                         break
@@ -631,10 +625,7 @@ class Server:
             OSError,
             asyncio.TimeoutError
         ) as e:
-            log(
-                "conexion %s: %s"
-                % (peer, e)
-            )
+            log("conexion %s: %s" % (peer, e))
 
         except Exception as e:
             log("handle %s: excepcion inesperada: %r" % (peer, e))
