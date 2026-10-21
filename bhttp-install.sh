@@ -1,4 +1,3 @@
-
 #!/usr/bin/env bash
 
 set -uo pipefail
@@ -10,13 +9,9 @@ SERVICE="bhttp"
 
 SERVER_URL="https://raw.githubusercontent.com/ChristopherAGT/bhttp-server/main/bhttp-server.py"
 
-CANDIDATOS=(8080 80 8443 443 2082 2095 8880 2052 3128)
-
 PUERTO=""
 SSHPORT=22
-DESINSTALAR=0
-NUEVO_USER=""
-NUEVO_PASS=""
+SSHPORT_EXPLICITO=0
 SOLO_DIAG=0
 
 while [ $# -gt 0 ]; do
@@ -30,19 +25,11 @@ while [ $# -gt 0 ]; do
       [ $# -ge 2 ] || { echo "Falta el puerto SSH"; exit 2; }
       shift
       SSHPORT="$1"
+      SSHPORT_EXPLICITO=1
       ;;
-    --crear-usuario)
-      [ $# -ge 2 ] || { echo "Falta el usuario"; exit 2; }
-      shift
-      NUEVO_USER="$1"
+    --diag)
+      SOLO_DIAG=1
       ;;
-    --clave)
-      [ $# -ge 2 ] || { echo "Falta la clave"; exit 2; }
-      shift
-      NUEVO_PASS="$1"
-      ;;
-    --desinstalar) DESINSTALAR=1 ;;
-    --diag) SOLO_DIAG=1 ;;
     -h|--help)
       sed -n '1,35p' "$0"
       exit 0
@@ -63,63 +50,6 @@ paso()  { printf '\n[%s] %s\n' "$1" "$2"; }
 if [ "$(id -u)" != 0 ]; then
   rojo "Ejecutalo como root: sudo bash $0"
   exit 2
-fi
-
-# ------------------------------------------------------------
-# Crear usuario SSH opcional
-# ------------------------------------------------------------
-
-crear_usuario() {
-  local u="$1" p="$2"
-
-  if ! [[ "$u" =~ ^[a-z_][a-z0-9_-]*\$?$ ]]; then
-    rojo "Nombre de usuario invalido"
-    return 1
-  fi
-
-  if id "$u" >/dev/null 2>&1; then
-    info "El usuario '$u' ya existe; se actualizara su clave"
-  else
-    useradd -M -s /bin/bash "$u" || {
-      rojo "No pude crear el usuario"
-      return 1
-    }
-    info "Usuario creado: $u"
-  fi
-
-  if [ -z "$p" ]; then
-    p="$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 16)"
-    [ -n "$p" ] || {
-      rojo "No pude generar una clave"
-      return 1
-    }
-  fi
-
-  if ! printf '%s:%s\n' "$u" "$p" | chpasswd; then
-    rojo "No pude establecer la clave"
-    return 1
-  fi
-
-  USER_FINAL="$u"
-  PASS_FINAL="$p"
-}
-
-if [ -n "$NUEVO_USER" ]; then
-  echo "=== Crear usuario SSH ==="
-
-  if crear_usuario "$NUEVO_USER" "$NUEVO_PASS"; then
-    verde "Usuario listo"
-    echo "  Usuario: $USER_FINAL"
-    echo "  Clave:   $PASS_FINAL"
-  else
-    exit 1
-  fi
-
-  if [ -z "$PUERTO" ] && [ "$DESINSTALAR" = 0 ] \
-     && [ "$SOLO_DIAG" = 0 ]; then
-    echo "Usuario creado. Para instalar: bash $0"
-    exit 0
-  fi
 fi
 
 # ------------------------------------------------------------
@@ -163,27 +93,6 @@ if [ "$SOLO_DIAG" = 1 ]; then
   exit 0
 fi
 
-# ------------------------------------------------------------
-# Desinstalar
-# ------------------------------------------------------------
-
-if [ "$DESINSTALAR" = 1 ]; then
-  systemctl disable --now "$SERVICE" 2>/dev/null || true
-
-  rm -f "$UNIT"
-  rm -rf "$DESTDIR"
-  rm -f /etc/sysctl.d/99-bhttp.conf
-  rm -f /etc/security/limits.d/99-bhttp.conf
-
-  systemctl daemon-reload
-
-  verde "BHTTP desinstalado"
-  info "Los ajustes TCP aplicados en el kernel pueden persistir hasta reiniciar"
-  info "No se eliminan los usuarios SSH creados"
-
-  exit 0
-fi
-
 echo "=== Instalador BHTTP ==="
 
 for cmd in python3 systemctl; do
@@ -199,10 +108,8 @@ if ! command -v curl >/dev/null 2>&1; then
 fi
 
 # ------------------------------------------------------------
-# Seleccionar puerto
+# Funciones para comprobar puertos
 # ------------------------------------------------------------
-
-paso "1/4" "Seleccionando puerto"
 
 ocupados() {
   if command -v ss >/dev/null 2>&1; then
@@ -224,44 +131,58 @@ libre() {
   ! ocupados | grep -qx "$1"
 }
 
-primer_libre=""
+# ------------------------------------------------------------
+# Seleccionar puerto BHTTP y puerto de redireccion
+# ------------------------------------------------------------
 
-for p in "${CANDIDATOS[@]}"; do
-  if libre "$p"; then
-    primer_libre="$p"
-    break
-  fi
-done
+paso "1/4" "Configurando puertos"
 
 if [ -z "$PUERTO" ]; then
   if [ -t 0 ]; then
-    read -r -p "Puerto BHTTP [${primer_libre:-8080}]: " PUERTO
-    PUERTO="${PUERTO:-${primer_libre:-8080}}"
+    echo
+    read -r -p "¿Que puerto deseas utilizar para BHTTP? " PUERTO
   else
-    PUERTO="${primer_libre:-8080}"
-    info "Puerto elegido automaticamente: $PUERTO"
+    rojo "Debes indicar el puerto en modo no interactivo."
+    info "Ejemplo: bash $0 --puerto 8880 --ssh-puerto 22"
+    exit 2
   fi
+fi
+
+if [ "$SSHPORT_EXPLICITO" = 0 ] && [ -t 0 ]; then
+  read -r -p "¿A que puerto deseas redireccionar? [22]: " RESP_SSH
+  SSHPORT="${RESP_SSH:-22}"
 fi
 
 if ! [[ "$PUERTO" =~ ^[0-9]+$ ]] \
    || [ "$PUERTO" -lt 1 ] || [ "$PUERTO" -gt 65535 ]; then
-  rojo "Puerto invalido: $PUERTO"
+  rojo "Puerto BHTTP invalido: $PUERTO"
   exit 1
 fi
 
 if ! [[ "$SSHPORT" =~ ^[0-9]+$ ]] \
    || [ "$SSHPORT" -lt 1 ] || [ "$SSHPORT" -gt 65535 ]; then
-  rojo "Puerto SSH invalido: $SSHPORT"
+  rojo "Puerto de redireccion invalido: $SSHPORT"
+  exit 1
+fi
+
+if [ "$PUERTO" = "$SSHPORT" ]; then
+  rojo "El puerto BHTTP no puede ser igual al puerto de redireccion"
+  info "Elige dos puertos diferentes."
   exit 1
 fi
 
 if ! libre "$PUERTO"; then
   rojo "El puerto $PUERTO ya esta ocupado"
+  info "Elige otro puerto o libera el puerto antes de continuar."
   exit 1
 fi
 
-info "Puerto BHTTP: $PUERTO"
-info "Backend SSH: 127.0.0.1:$SSHPORT"
+info "Puerto de escucha BHTTP: $PUERTO"
+info "Puerto de redireccion SSH: $SSHPORT"
+
+if ! command -v ss >/dev/null 2>&1; then
+  info "Aviso: no se encontro ss; la comprobacion de puertos depende de netstat."
+fi
 
 # ------------------------------------------------------------
 # Descargar el servidor Python desde GitHub
@@ -494,7 +415,6 @@ def open_sock():
 
 
 try:
-    # Handshake
     payload = MAGIC + bytes([1, 0]) + (0).to_bytes(4, "big")
 
     with open_sock() as sock:
@@ -506,7 +426,6 @@ try:
 
     print("HANDSHAKE_OK")
 
-    # Prueba de subida y banner SSH
     with open_sock() as sock:
         send(sock, 1, 0)
         status, _ = response(sock)
@@ -522,7 +441,6 @@ try:
         )
         response(sock)
 
-    # La comprobacion real del banner requiere descargar datos.
     with open_sock() as sock:
         sock.settimeout(5)
         batch = (1399).to_bytes(4, "big") + bytes([0, 1])
@@ -571,7 +489,6 @@ if echo "$VERIF" | grep -q HANDSHAKE_OK; then
   info "Estado: systemctl status bhttp"
   info "Reiniciar: systemctl restart bhttp"
   info "Logs: journalctl -u bhttp -f"
-  info "Desinstalar: bash $0 --desinstalar"
   echo
   diagnostico_ssh
 else
