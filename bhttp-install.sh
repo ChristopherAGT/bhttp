@@ -2,6 +2,18 @@
 
 set -uo pipefail
 
+# ------------------------------------------------------------
+# CONFIGURACION PRINCIPAL DEL INSTALADOR
+# ------------------------------------------------------------
+# DESTDIR: directorio donde se instala el servidor Python.
+# SERVER_PY: archivo Python descargado desde GitHub.
+# UNIT: archivo de unidad systemd para administrar el servicio.
+# SERVICE: nombre del servicio que se inicia con systemd.
+#
+# Este instalador descarga el servidor; no lo escribe dentro
+# del propio script.
+# ------------------------------------------------------------
+
 DESTDIR="/usr/local/lib/bhttp"
 SERVER_PY="$DESTDIR/bhttp-server.py"
 UNIT="/etc/systemd/system/bhttp.service"
@@ -9,10 +21,27 @@ SERVICE="bhttp"
 
 SERVER_URL="https://raw.githubusercontent.com/ChristopherAGT/bhttp-server/main/bhttp-server.py"
 
+# PUERTO: puerto público en el que escuchará BHTTP.
+# SSHPORT: puerto del servicio SSH al que se redirige el túnel.
+# SSHPORT_EXPLICITO: indica si el puerto SSH se proporcionó
+# mediante --ssh-puerto, evitando preguntar de nuevo.
+# SOLO_DIAG: ejecuta únicamente el diagnóstico SSH/red.
 PUERTO=""
 SSHPORT=22
 SSHPORT_EXPLICITO=0
 SOLO_DIAG=0
+
+# ------------------------------------------------------------
+# PROCESAR ARGUMENTOS DE LA LINEA DE COMANDOS
+# ------------------------------------------------------------
+# Ejemplos:
+#   bash bhttp-install.sh
+#   bash bhttp-install.sh --puerto 8880 --ssh-puerto 22
+#   bash bhttp-install.sh --diag
+#
+# La instalación interactiva pregunta los puertos que falten.
+# En modo no interactivo, el puerto BHTTP debe especificarse.
+# ------------------------------------------------------------
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -42,10 +71,26 @@ while [ $# -gt 0 ]; do
   shift
 done
 
+# ------------------------------------------------------------
+# FUNCIONES VISUALES
+# ------------------------------------------------------------
+# Mensajes en rojo: errores y advertencias.
+# Mensajes en verde: operaciones completadas correctamente.
+# info: detalles adicionales.
+# paso: separa visualmente las etapas del instalador.
+# ------------------------------------------------------------
+
 rojo()  { printf '\033[31m%s\033[0m\n' "$*"; }
 verde() { printf '\033[32m%s\033[0m\n' "$*"; }
 info()  { printf '  %s\n' "$*"; }
 paso()  { printf '\n[%s] %s\n' "$1" "$2"; }
+
+# ------------------------------------------------------------
+# COMPROBAR PRIVILEGIOS
+# ------------------------------------------------------------
+# Se necesita root para escribir en /usr/local/lib, crear la
+# unidad systemd y modificar los ajustes globales del sistema.
+# ------------------------------------------------------------
 
 if [ "$(id -u)" != 0 ]; then
   rojo "Ejecutalo como root: sudo bash $0"
@@ -53,7 +98,20 @@ if [ "$(id -u)" != 0 ]; then
 fi
 
 # ------------------------------------------------------------
-# Diagnostico SSH y red
+# DIAGNOSTICO SSH Y RED
+# ------------------------------------------------------------
+# Una conexión BHTTP puede establecerse correctamente y aun así
+# no permitir navegar si SSH no acepta el forwarding o si la
+# VPS carece de conectividad de salida.
+#
+# Esta función comprueba:
+# 1. AllowTcpForwarding en sshd_config.
+# 2. Conectividad TCP hacia 8.8.8.8:53.
+# 3. Si existe un socket escuchando en el puerto SSH configurado.
+#
+# La lectura de sshd_config es orientativa: otras directivas,
+# archivos incluidos o bloques Match pueden cambiar el valor
+# efectivo de la configuración SSH.
 # ------------------------------------------------------------
 
 diagnostico_ssh() {
@@ -74,12 +132,16 @@ diagnostico_ssh() {
     info "AllowTcpForwarding: ${fwd:-valor predeterminado o no definido}"
   fi
 
+  # Prueba de salida TCP hacia un servidor DNS público.
+  # Comprueba conectividad a ese destino concreto, no toda la red.
   if timeout 5 bash -c 'exec 3<>/dev/tcp/8.8.8.8/53' 2>/dev/null; then
     info "Salida TCP a 8.8.8.8:53: OK"
   else
     rojo "No se pudo abrir TCP hacia 8.8.8.8:53"
   fi
 
+  # Comprueba el puerto backend configurado para SSH.
+  # No modifica el puerto ni reinicia el servicio SSH.
   if command -v ss >/dev/null 2>&1 \
      && ss -ltn | awk '{print $4}' | grep -qE ":${SSHPORT}$"; then
     info "Puerto SSH $SSHPORT: escuchando"
@@ -88,12 +150,22 @@ diagnostico_ssh() {
   fi
 }
 
+# Si se solicita solo el diagnóstico, no se instala ni modifica
+# el servicio BHTTP.
 if [ "$SOLO_DIAG" = 1 ]; then
   diagnostico_ssh
   exit 0
 fi
 
 echo "=== Instalador BHTTP ==="
+
+# ------------------------------------------------------------
+# COMPROBAR DEPENDENCIAS
+# ------------------------------------------------------------
+# python3: ejecuta el servidor y valida el archivo descargado.
+# systemctl: administra el servicio BHTTP.
+# curl: descarga el servidor desde GitHub y consulta la IP pública.
+# ------------------------------------------------------------
 
 for cmd in python3 systemctl; do
   command -v "$cmd" >/dev/null 2>&1 || {
@@ -108,7 +180,19 @@ if ! command -v curl >/dev/null 2>&1; then
 fi
 
 # ------------------------------------------------------------
-# Funciones para comprobar puertos
+# FUNCIONES PARA COMPROBAR PUERTOS
+# ------------------------------------------------------------
+# ocupados:
+#   Obtiene los puertos TCP que tienen sockets en escucha.
+#   Prefiere ss y utiliza netstat como alternativa.
+#
+# libre:
+#   Comprueba si el puerto indicado no aparece en esa lista.
+#
+# Esta comprobación detecta sockets locales en escucha.
+# No garantiza que el puerto sea accesible desde Internet:
+# el firewall, las reglas del proveedor o el enrutamiento pueden
+# bloquear conexiones externas aunque el puerto esté libre.
 # ------------------------------------------------------------
 
 ocupados() {
@@ -132,7 +216,20 @@ libre() {
 }
 
 # ------------------------------------------------------------
-# Seleccionar puerto BHTTP y puerto de redireccion
+# SELECCIONAR PUERTO BHTTP Y PUERTO DE REDIRECCION
+# ------------------------------------------------------------
+# Puerto BHTTP:
+#   Es el puerto de entrada donde escucha el servidor BHTTP.
+#
+# Puerto de redirección:
+#   Es el puerto del backend SSH local al que se conecta BHTTP.
+#   Por defecto se utiliza el puerto 22.
+#
+# Se permite indicar ambos valores mediante argumentos o
+# introducirlos cuando el instalador pregunta.
+#
+# Se validan los rangos TCP y se evita utilizar el mismo número
+# para la escucha BHTTP y para el backend SSH.
 # ------------------------------------------------------------
 
 paso "1/4" "Configurando puertos"
@@ -148,11 +245,14 @@ if [ -z "$PUERTO" ]; then
   fi
 fi
 
+# Si no se indicó explícitamente el puerto SSH y hay terminal,
+# se pregunta. Si se presiona Enter, se conserva el puerto 22.
 if [ "$SSHPORT_EXPLICITO" = 0 ] && [ -t 0 ]; then
   read -r -p "¿A que puerto deseas redireccionar? [22]: " RESP_SSH
   SSHPORT="${RESP_SSH:-22}"
 fi
 
+# Los puertos TCP válidos están entre 1 y 65535.
 if ! [[ "$PUERTO" =~ ^[0-9]+$ ]] \
    || [ "$PUERTO" -lt 1 ] || [ "$PUERTO" -gt 65535 ]; then
   rojo "Puerto BHTTP invalido: $PUERTO"
@@ -171,6 +271,8 @@ if [ "$PUERTO" = "$SSHPORT" ]; then
   exit 1
 fi
 
+# Evita continuar si ya existe un socket TCP escuchando en
+# el puerto de entrada seleccionado para BHTTP.
 if ! libre "$PUERTO"; then
   rojo "El puerto $PUERTO ya esta ocupado"
   info "Elige otro puerto o libera el puerto antes de continuar."
@@ -185,7 +287,21 @@ if ! command -v ss >/dev/null 2>&1; then
 fi
 
 # ------------------------------------------------------------
-# Descargar el servidor Python desde GitHub
+# DESCARGAR Y VALIDAR EL SERVIDOR PYTHON
+# ------------------------------------------------------------
+# El servidor se obtiene desde SERVER_URL.
+#
+# Primero se descarga a un archivo temporal dentro del directorio
+# de instalación para evitar reemplazar el servidor con una
+# descarga incompleta.
+#
+# Después se comprueba:
+# 1. Que curl pueda descargar el archivo sin error HTTP.
+# 2. Que Python pueda analizar su sintaxis.
+# 3. Que existan las definiciones esperadas del servidor.
+#
+# Solo después de pasar esas comprobaciones se reemplaza el
+# archivo instalado.
 # ------------------------------------------------------------
 
 paso "2/4" "Descargando servidor desde GitHub"
@@ -205,12 +321,16 @@ if ! curl -fLsS --connect-timeout 10 --max-time 60 \
   exit 1
 fi
 
+# Validación sintáctica sin ejecutar el código descargado.
 if ! python3 -c 'import ast,sys; ast.parse(open(sys.argv[1], encoding="utf-8").read())' "$TMP_PY"; then
   rm -f "$TMP_PY"
   rojo "El archivo Python descargado tiene errores de sintaxis"
   exit 1
 fi
 
+# Comprueba que el archivo tenga las definiciones principales
+# esperadas. Es una comprobación básica, no una auditoría del
+# contenido ni una garantía de compatibilidad con la aplicación.
 if ! grep -q 'class Server' "$TMP_PY" \
    || ! grep -q 'async def serve' "$TMP_PY"; then
   rm -f "$TMP_PY"
@@ -229,7 +349,33 @@ fi
 info "Servidor instalado: $SERVER_PY"
 
 # ------------------------------------------------------------
-# Configurar systemd
+# CONFIGURAR SYSTEMD
+# ------------------------------------------------------------
+# Se crea la unidad bhttp.service para ejecutar el servidor
+# automáticamente al iniciar la VPS.
+#
+# --host 0.0.0.0:
+#   Escucha en todas las interfaces IPv4.
+#
+# --port:
+#   Puerto público de entrada seleccionado para BHTTP.
+#
+# --backend-host 127.0.0.1:
+#   El backend SSH se encuentra en la propia VPS.
+#
+# --backend-port:
+#   Puerto SSH al que se redirige el túnel.
+#
+# Restart=always:
+#   Intenta volver a iniciar el proceso si termina.
+#
+# RestartSec=2:
+#   Espera dos segundos antes de intentar reiniciarlo.
+#
+# LimitNOFILE=1048576:
+#   Eleva el límite de descriptores de archivos del servicio.
+#   Los sockets TCP también consumen descriptores; un límite
+#   demasiado bajo puede provocar errores bajo alta concurrencia.
 # ------------------------------------------------------------
 
 PYBIN="$(command -v python3)"
@@ -253,7 +399,36 @@ EOF
 chmod 644 "$UNIT"
 
 # ------------------------------------------------------------
-# Ajustes TCP
+# AJUSTES TCP DEL SISTEMA
+# ------------------------------------------------------------
+# El cliente BHTTP puede generar muchas conexiones TCP cortas.
+# Con límites predeterminados bajos, una VPS puede experimentar
+# colas saturadas o falta de descriptores durante picos de tráfico.
+#
+# Ajustes de capacidad:
+#   somaxconn:
+#     Límite de la cola de conexiones pendientes de aceptación.
+#
+#   netdev_max_backlog:
+#     Cola de paquetes recibidos que esperan procesamiento.
+#
+#   tcp_max_syn_backlog:
+#     Cola de conexiones que aún están completando el handshake.
+#
+#   ip_local_port_range:
+#     Rango de puertos efímeros disponibles para conexiones salientes.
+#
+#   fs.file-max:
+#     Límite global de descriptores de archivos del kernel.
+#
+# También se escriben valores explícitos para algunas opciones
+# TCP para evitar que permanezcan valores activados por ajustes
+# anteriores de este mismo archivo.
+#
+# IMPORTANTE:
+# Estos valores no garantizan que desaparezcan los cortes.
+# El rendimiento también depende del kernel, la RAM, la CPU,
+# el firewall, el proveedor y el comportamiento del cliente.
 # ------------------------------------------------------------
 
 paso "tcp" "Configurando capacidad TCP"
@@ -262,26 +437,51 @@ SYSCTL_FILE="/etc/sysctl.d/99-bhttp.conf"
 
 cat > "$SYSCTL_FILE" <<'EOF'
 # BHTTP: ajustes de capacidad TCP.
+# Archivo administrado por el instalador BHTTP.
+#
+# Capacidad de colas y descriptores:
 net.core.somaxconn = 4096
 net.core.netdev_max_backlog = 16384
 net.ipv4.tcp_max_syn_backlog = 8192
 net.ipv4.ip_local_port_range = 1024 65535
 fs.file-max = 1048576
+#
+# Valores explícitos para evitar conservar configuraciones
+# anteriores que pudieran haber quedado activadas.
 net.ipv4.tcp_fastopen = 0
 net.ipv4.tcp_tw_reuse = 0
 net.ipv4.tcp_slow_start_after_idle = 1
 net.ipv4.tcp_mtu_probing = 0
 EOF
 
+# conntrack:
+# La tabla de seguimiento de conexiones se utiliza cuando el
+# kernel dispone de ese subsistema. Se añade el ajuste únicamente
+# si el parámetro existe en esta VPS.
 if [ -e /proc/sys/net/netfilter/nf_conntrack_max ]; then
   echo "net.netfilter.nf_conntrack_max = 262144" >> "$SYSCTL_FILE"
 fi
 
+# Aplica los parámetros disponibles en el kernel en ejecución.
+# Si falla alguno, se conserva el archivo para que el administrador
+# pueda revisar los mensajes y comprobar la compatibilidad.
 if sysctl -p "$SYSCTL_FILE" >/dev/null 2>&1; then
   info "Ajustes TCP aplicados"
 else
   info "Algunos ajustes TCP no pudieron aplicarse"
+  sysctl -p "$SYSCTL_FILE" 2>/dev/null | sed 's/^/    /' || true
 fi
+
+# ------------------------------------------------------------
+# LIMITES GLOBALES DE DESCRIPTORES
+# ------------------------------------------------------------
+# Este archivo configura límites nofile para sesiones que utilicen
+# PAM y para root. No sustituye LimitNOFILE de systemd: el límite
+# explícito de la unidad controla el proceso del servicio BHTTP.
+#
+# Estos límites globales no siempre afectan a servicios ya
+# iniciados ni a todos los tipos de sesión.
+# ------------------------------------------------------------
 
 mkdir -p /etc/security/limits.d
 
@@ -293,7 +493,19 @@ root hard nofile 1048576
 EOF
 
 # ------------------------------------------------------------
-# Arrancar servicio
+# RECARGAR SYSTEMD E INICIAR BHTTP
+# ------------------------------------------------------------
+# daemon-reload:
+#   Hace que systemd vuelva a leer los archivos de unidades.
+#
+# enable:
+#   Habilita el servicio para que arranque con el sistema.
+#
+# restart:
+#   Inicia el servicio o reinicia la instancia existente.
+#
+# Si el inicio falla, se muestran los últimos registros para
+# ayudar a identificar errores de configuración o ejecución.
 # ------------------------------------------------------------
 
 paso "3/4" "Iniciando servicio"
@@ -314,6 +526,8 @@ if ! systemctl restart "$SERVICE"; then
   exit 1
 fi
 
+# Espera hasta diez segundos para que systemd inicie el proceso
+# y el puerto seleccionado aparezca entre los sockets en escucha.
 LEVANTADO=0
 
 for _ in $(seq 1 10); do
@@ -335,7 +549,20 @@ fi
 verde "BHTTP activo en el puerto $PUERTO"
 
 # ------------------------------------------------------------
-# Verificacion local del protocolo
+# VERIFICACION LOCAL DEL PROTOCOLO BHTTP
+# ------------------------------------------------------------
+# Esta prueba intenta comprobar localmente el protocolo mediante
+# el puerto de escucha. No sustituye una prueba real desde una
+# aplicación externa ni garantiza el acceso desde Internet.
+#
+# Se comprueban:
+#   1. El handshake BHP1.
+#   2. La respuesta al registro de sesión.
+#   3. La comunicación de prueba con el backend SSH.
+#   4. El formato de una respuesta de descarga.
+#
+# Si el servidor responde al handshake pero no entrega un banner
+# SSH, se distingue esa situación de un error de handshake.
 # ------------------------------------------------------------
 
 paso "4/4" "Verificando protocolo BHTTP"
@@ -415,6 +642,7 @@ def open_sock():
 
 
 try:
+    # 1. Handshake BHP1.
     payload = MAGIC + bytes([1, 0]) + (0).to_bytes(4, "big")
 
     with open_sock() as sock:
@@ -426,6 +654,7 @@ try:
 
     print("HANDSHAKE_OK")
 
+    # 2. Registro de sesión.
     with open_sock() as sock:
         send(sock, 1, 0)
         status, _ = response(sock)
@@ -433,6 +662,8 @@ try:
     if status != 0:
         raise RuntimeError("registro no valido")
 
+    # 3. Envía una cadena SSH de prueba por el modo de subida.
+    # Esta prueba no inicia una sesión SSH autenticada.
     with open_sock() as sock:
         sock.settimeout(5)
         send(
@@ -441,6 +672,7 @@ try:
         )
         response(sock)
 
+    # 4. Comprueba la estructura de una respuesta de descarga.
     with open_sock() as sock:
         sock.settimeout(5)
         batch = (1399).to_bytes(4, "big") + bytes([0, 1])
@@ -469,6 +701,18 @@ PYTEST
 )"
 
 echo "$VERIF" | sed 's/^/  /'
+
+# ------------------------------------------------------------
+# MOSTRAR DATOS DE CONEXION Y RESULTADO FINAL
+# ------------------------------------------------------------
+# Primero intenta obtener la IP pública mediante un servicio HTTP.
+# Si no está disponible, utiliza la primera dirección que reporte
+# hostname -I como alternativa.
+#
+# La IP y el puerto mostrados son los datos de conexión del
+# servidor; el acceso externo también depende de las reglas de
+# firewall y de la red del proveedor.
+# ------------------------------------------------------------
 
 echo
 IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
